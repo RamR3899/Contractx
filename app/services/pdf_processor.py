@@ -1,95 +1,665 @@
-import fitz  # PyMuPDF
-from typing import List, Dict, Any
-from PIL import Image
-import io
+import os
+import json
 import base64
+import logging
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import google.generativeai as genai
+from pdf2image import convert_from_bytes
+import io
+from app.config.config import Config
+
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+genai.configure(api_key=Config.GEMINI_API_KEY)
+
+app = FastAPI(title="PDF Table Extraction API", version="1.0.0")
+
 
 class PDFProcessor:
-    """PDF Processor for ContractX – extracts text, images, PIL page image, and raw bytes"""
-
-    async def extract_pages(self, pdf_path: str, dpi: int = 350) -> List[Dict[str, Any]]:
+    """Class for processing PDF files and extracting tables"""
+    
+    def __init__(self):
+        self.output_dir = Path("extracted_tables")
+        self.log_dir = Path("logs")
+        self.output_dir.mkdir(exist_ok=True)
+        self.log_dir.mkdir(exist_ok=True)
+    
+    async def extract_pages(self, pdf_path: str, dpi: int = None) -> List[Dict[str, Any]]:
         """
-        Extract each page as:
-         - text
-         - inline images
-         - PIL image (for table detection)
-         - image_bytes (PNG raw bytes for Gemini)
+        Convert PDF file to image pages with text extraction
+        
+        Args:
+            pdf_path: Path to PDF file
+            dpi: DPI for image conversion (default None)
+            
+        Returns:
+            List of page data dictionaries with 'pil_image' and 'text' keys
         """
-
-        pages = []
-
         try:
-            doc = fitz.open(pdf_path)
-            print(f"[OK] PDF opened: {len(doc)} pages")
-
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-
-                # -----------------------------
-                # 1️⃣ Extract TEXT
-                # -----------------------------
-                text = page.get_text("text")
-
-                # -----------------------------
-                # 2️⃣ Extract INLINE IMAGES
-                # -----------------------------
-                images = []
-                for img_index, img_info in enumerate(page.get_images(full=True)):
-                    try:
-                        xref = img_info[0]
-                        base_image = doc.extract_image(xref)
-                        img_bytes = base_image["image"]
-                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-                        images.append({
-                            "image_id": f"page_{page_num + 1}_img_{img_index + 1}",
-                            "format": base_image["ext"],
-                            "data": img_b64
-                        })
-
-                    except Exception as e:
-                        print(f"[!] Error extracting image {img_index} on page {page_num + 1}: {e}")
-
-                # -----------------------------
-                # 3️⃣ Render FULL PAGE as PIL Image (for table detection)
-                # -----------------------------
-                zoom = dpi / 72
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
-
-                img_bytes = pix.tobytes("png")
-                pil_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-                # Also store image_bytes for Gemini API
-                image_bytes = img_bytes
-
-                # -----------------------------
-                # 4️⃣ Build Page Object
-                # -----------------------------
-                page_data = {
-                    "page_number": page_num + 1,
-                    "text": text,
-                    "text_length": len(text),
-                    "images": images,
-                    "image_count": len(images),
-
-                    # Required for table detection + extraction
-                    "pil_image": pil_image,
-                    "image_bytes": image_bytes,
-
-                    "dimensions": {
-                        "width": page.rect.width,
-                        "height": page.rect.height
-                    },
-
-                    # Raw PyMuPDF page object if needed later
-                    "raw_page": page
-                }
-
-                pages.append(page_data)
-
-            doc.close()
-            return pages
-
+            with open(pdf_path, 'rb') as f:
+                pdf_bytes = f.read()
+            
+            images = convert_from_bytes(pdf_bytes, dpi=dpi)
+            
+            # Convert images to page data with text extraction
+            page_data_list = []
+            for page_image in images:
+                page_data = await self._extract_page_data(page_image)
+                page_data_list.append(page_data)
+            
+            return page_data_list
         except Exception as e:
-            raise Exception(f"Error extracting PDF pages: {str(e)}")
+            logger.error(f"Error extracting pages from {pdf_path}: {str(e)}")
+            raise
+    
+    async def _extract_page_data(self, page_image) -> Dict[str, Any]:
+        """
+        Extract text from a page image using Gemini Vision API
+        
+        Args:
+            page_image: PIL Image object
+            
+        Returns:
+            Dictionary with 'pil_image' and 'text' keys
+        """
+        try:
+            # Extract text using Gemini Vision API
+            model = genai.GenerativeModel(Config.GEMINI_MODEL)
+            
+            text_extraction_prompt = """Extract ALL text from this page image. 
+Return the complete text content, preserving the layout and structure as much as possible.
+If there are tables, extract them row by row.
+If there are headers/footers, include them.
+Return only the extracted text, no other commentary."""
+            
+            response = model.generate_content([text_extraction_prompt, page_image])
+            extracted_text = response.text.strip() if response.text else ""
+            
+            return {
+                'pil_image': page_image,
+                'text': extracted_text
+            }
+        except Exception as e:
+            logger.warning(f"Error extracting text from page: {str(e)}")
+            # Return empty text if extraction fails
+            return {
+                'pil_image': page_image,
+                'text': ""
+            }
+    
+    async def detect_tables_in_page(self, page_image, page_num: int, total_pages: int) -> Dict[str, Any]:
+        """
+        Detect and extract tables from a single page using Gemini API
+        
+        Args:
+            page_image: PIL Image object
+            page_num: Current page number
+            total_pages: Total number of pages
+            
+        Returns:
+            Dictionary with table detection results
+        """
+        return detect_tables_in_page(page_image, page_num, total_pages)
+
+
+# Create output directory
+OUTPUT_DIR = Path("extracted_tables")
+LOG_DIR = Path("logs")
+OUTPUT_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(exist_ok=True)
+
+# Configure logging
+log_filename = LOG_DIR / f"extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler()  # Also print to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Table extraction instruction prompt
+INSTRUCTION_TEXT = """TABLE EXTRACTION (COMPLETE STRUCTURE)
+═══════════════════════════════════════════════════════════════════════════════
+DETECTION STRATEGY:
+Scan ENTIRE page for:
+• Explicit grid lines (bordered tables)
+• Financial tables (numbers, currency, percentages)
+• Schedule tables (dates, timelines, deliverables)
+• Comparison tables (features, specifications)
+• Nested tables (tables within tables)
+• Tables in margins, headers, footers
+• Tables embedded in screenshots
+
+⚠️ CRITICAL: DETECT TABLE CONTINUATION
+• If a table is cut off at the bottom of the page, mark "continues_to_next_page": true
+• If a table starts at the top without headers (continuing from previous page), mark "continued_from_previous_page": true
+• Look for indicators like:
+  - Table ends at page bottom without closing line
+  - No clear table footer or totals row
+  - Content appears truncated
+  - Page starts with table rows but no headers
+
+FOR EVERY TABLE:
+1. STRUCTURE EXTRACTION
+   • table_id: Unique identifier (e.g., T1, T2, T3...)
+   • table_title: Title or caption (if present, otherwise empty string)
+   • position: Location on page (e.g., "top", "center", "bottom")
+   • size: Coverage area (small/medium/large/full-width)
+   • table_type: "financial", "schedule", "comparison", "data", "specification"
+   • continues_to_next_page: true/false (if table is cut off at bottom)
+   • continued_from_previous_page: true/false (if table continues from previous page)
+
+2. HEADERS
+   • Extract ALL header rows (may be multiple rows)
+   • Preserve column header hierarchy
+   • Example: ["Deliverables", "Estimated Sign-off", "Status"]
+   • If continuing from previous page, headers may be empty: []
+
+3. DATA ROWS - COMPLETE EXTRACTION
+   • Extract EVERY row
+   • Extract EVERY cell value
+   • NO truncation, NO "..." placeholders
+   • Preserve cell data types (text, number, currency, date, percentage)
+
+4. MERGED CELLS DETECTION & HANDLING ⚠️ CRITICAL
+   
+   VISUAL INDICATORS OF MERGED CELLS:
+   • Cell borders that span multiple rows/columns
+   • Single text value positioned over multiple row/column spaces
+   • Large whitespace in bordered areas
+   • Content logically shared across rows
+   
+   MERGED CELL EXTRACTION RULES:
+   • If cell spans multiple rows → REPEAT value in each row
+   • If cell spans multiple columns → REPEAT value in each column
+   • Mark merged regions in "merged_cells" field
+   • NEVER output "(blank)" where merged cells exist
+   
+   EXAMPLE INPUT (Visual):
+   ┌────────────────────────────┬──────────────┐
+   │ Task 1                     │              │
+   ├────────────────────────────┤  Aug 2024    │
+   │ Task 2                     │              │
+   ├────────────────────────────┼──────────────┤
+   
+   REQUIRED OUTPUT:
+   {
+     "rows": [
+       ["Task 1", "Aug 2024"],
+       ["Task 2", "Aug 2024"]
+     ],
+     "has_merged_cells": true,
+     "merged_cells": "Column 2: 'Aug 2024' spans rows 1-2"
+   }
+
+5. TABLE METADATA
+   • total_rows: Row count (excluding headers)
+   • total_columns: Column count
+   • has_merged_cells: true/false
+   • merged_cells: Description of merged regions (string or null)
+   • continues_to_next_page: true/false
+   • continued_from_previous_page: true/false
+   • data_types: Type of each column (optional)
+   • notes: Any footnotes or table notes (optional)
+
+REQUIRED JSON OUTPUT SCHEMA:
+{
+  "table_id": "T<idx>",
+  "table_title": "<title or empty string>",
+  "position": "<position on page>",
+  "size": "<small/medium/large/full-width>",
+  "table_type": "<financial/schedule/comparison/data/specification>",
+  "headers": ["Column1", "Column2", "Column3"],
+  "rows": [
+    ["Value1", "Value2", "Value3"],
+    ["Value4", "Value5", "Value6"]
+  ],
+  "total_rows": <number>,
+  "total_columns": <number>,
+  "has_merged_cells": <true/false>,
+  "merged_cells": "<description or null>",
+  "data_types": ["text", "number", "date"],
+  "notes": "<any footnotes or empty string>"
+}
+
+IMPORTANT RULES:
+- Return ONLY valid JSON with no commentary or markdown
+- Extract ALL rows completely, no truncation
+- Handle merged cells by repeating values as shown above
+- Always check if table continues to next page or continues from previous page
+- If a field is optional and not applicable, you may omit it or set to null/empty
+- Ensure headers are distinct from data rows
+- If NO tables found on page, return: {"has_tables": false, "tables": []}
+- If tables found, return: {"has_tables": true, "tables": [<table1>, <table2>, ...]}
+"""
+
+
+class TableExtractionResponse(BaseModel):
+    filename: str
+    total_pages: int
+    pages_with_tables: int
+    total_tables_extracted: int
+    processing_time_seconds: float
+    extraction_results: List[Dict[str, Any]]
+    output_file: str
+    log_file: str
+
+
+def encode_image_to_base64(image) -> str:
+    """Convert PIL Image to base64 string"""
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def detect_tables_in_page(page_image, page_num: int, total_pages: int) -> Dict[str, Any]:
+    """
+    Detect and extract tables from a single page using Gemini API
+    """
+    page_start_time = time.time()
+    logger.info(f"Starting page {page_num}/{total_pages}")
+
+    model_names = [
+        Config.GEMINI_MODEL
+    ]
+
+    last_error = None
+    model_used = None
+
+    try:
+        # Try model names one by one
+        for model_name in model_names:
+            try:
+                logger.info(f"  Trying model: {model_name}")
+                model_start = time.time()
+                
+                model = genai.GenerativeModel(model_name)
+
+                prompt = f"""Analyze this PDF page (Page {page_num}) and extract ALL tables found.
+
+{INSTRUCTION_TEXT}
+
+Respond with ONLY valid JSON, no markdown formatting, no code blocks."""
+
+                response = model.generate_content([prompt, page_image])
+                # Check if response was blocked by safety filters
+                if not response.parts:
+                    if hasattr(response, 'prompt_feedback'):
+                        block_reason = response.prompt_feedback
+                        logger.warning(f"  Response blocked by safety filters: {block_reason}")
+                    else:
+                        logger.warning(f"  Response blocked - no content returned")
+                    
+                    # Return empty result for this page
+                    page_time = time.time() - page_start_time
+                    return {
+                        "page_number": page_num,
+                        "model_used": model_name,
+                        "processing_time_seconds": round(page_time, 2),
+                        "has_tables": False,
+                        "tables": [],
+                        "table_count": 0,
+                        "error": "Response blocked by safety filters"
+                    }
+
+                response_text = response.text.strip()
+                model_time = time.time() - model_start
+                logger.info(f"  Success with {model_name} in {model_time:.2f}s")
+                model_used = model_name
+                break  # success
+
+            except Exception as e:
+                logger.warning(f"  Failed with {model_name}: {str(e)[:100]}")
+                last_error = e
+                if "404" in str(e) or "not found" in str(e).lower():
+                    continue  # try next model
+                else:
+                    raise
+
+        else:
+            # After loop, no model succeeded
+            error_msg = f"No available Gemini models found. Last error: {last_error}"
+            logger.error(f"  {error_msg}")
+            raise Exception(error_msg)
+
+        # ---------------------------
+        # Parse JSON response
+        # ---------------------------
+        logger.info(f"  Parsing response...")
+
+        # Remove code blocks if present
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+
+        response_text = response_text.strip()
+
+        result = json.loads(response_text)
+
+        page_time = time.time() - page_start_time
+        
+        has_tables = result.get("has_tables", False)
+        table_count = len(result.get("tables", []))
+        
+        if has_tables:
+            logger.info(f"  Found {table_count} table(s) on page {page_num}")
+            
+            # Log continuation info
+            for idx, table in enumerate(result.get("tables", []), 1):
+                continued_from = table.get("continued_from_previous_page", False)
+                continues_to = table.get("continues_to_next_page", False)
+                
+                if continued_from:
+                    logger.info(f"     Table T{idx}: Continued from previous page")
+                if continues_to:
+                    logger.info(f"     Table T{idx}: Continues to next page")
+        else:
+            logger.info(f"  No tables found on page {page_num}")
+        
+        logger.info(f"  Page {page_num} completed in {page_time:.2f}s")
+
+        return {
+            "page_number": page_num,
+            "model_used": model_used, 
+            "processing_time_seconds": round(page_time, 2),
+            "has_tables": result.get("has_tables", False),
+            "tables": result.get("tables", []),
+            "table_count": len(result.get("tables", []))
+        }
+
+    except json.JSONDecodeError as e:
+        page_time = time.time() - page_start_time
+        error_msg = f"Failed to parse JSON response: {str(e)}"
+        logger.error(f"  {error_msg}")
+        logger.debug(f"  Response text: {response_text[:500]}")
+
+        return {
+            "page_number": page_num,
+            "processing_time_seconds": round(page_time, 2),
+            "has_tables": False,
+            "tables": [],
+            "table_count": 0,
+            "error": f"Failed to parse JSON response: {str(e)}"
+        }
+
+    except Exception as e:
+        page_time = time.time() - page_start_time
+        error_msg = f"Error processing page: {str(e)}"
+        logger.error(f"  {error_msg}")
+        
+        return {
+            "page_number": page_num,
+            "processing_time_seconds": round(page_time, 2),
+            "has_tables": False,
+            "tables": [],
+            "table_count": 0,
+            "error": error_msg
+        }
+
+def merge_continued_tables(extraction_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge tables that span multiple pages
+    """
+    logger.info("Checking for multi-page table continuations...")
+    
+    merged_results = []
+    
+    for i, page_result in enumerate(extraction_results):
+        if not page_result.get("has_tables"):
+            merged_results.append(page_result)
+            continue
+        
+        tables = page_result.get("tables", [])
+        merged_tables = []
+        
+        for table in tables:
+            # Check if this table continues from previous page
+            if table.get("continued_from_previous_page") and i > 0:
+                # Find the table from previous page that continues here
+                prev_page = merged_results[-1]
+                if prev_page.get("has_tables"):
+                    prev_tables = prev_page.get("tables", [])
+                    
+                    # Find the last table that continues to next page
+                    for prev_table in reversed(prev_tables):
+                        if prev_table.get("continues_to_next_page"):
+                            # Merge rows
+                            logger.info(f"Merging table from page {i} to page {i+1}")
+                            prev_table["rows"].extend(table["rows"])
+                            prev_table["total_rows"] = len(prev_table["rows"])
+                            prev_table["continues_to_next_page"] = table.get("continues_to_next_page", False)
+                            
+                            # Add note about merge
+                            if "notes" in prev_table and prev_table["notes"]:
+                                prev_table["notes"] += f" | Continued to page {i+1}"
+                            else:
+                                prev_table["notes"] = f"Table spans pages {i} to {i+1}"
+                            
+                            # Don't add this table separately
+                            break
+                    else:
+                        # No matching previous table found, add as new
+                        merged_tables.append(table)
+                else:
+                    merged_tables.append(table)
+            else:
+                merged_tables.append(table)
+        
+        page_result["tables"] = merged_tables
+        page_result["table_count"] = len(merged_tables)
+        merged_results.append(page_result)
+    
+    return merged_results
+
+def process_pdf(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Process entire PDF and extract tables from all pages
+    """
+    start_time = time.time()
+    logger.info("="*80)
+    logger.info(f"Starting PDF extraction: {filename}")
+    logger.info("="*80)
+
+    try:
+        # Convert PDF to images
+        logger.info("Converting PDF to images...")
+        convert_start = time.time()
+        images = convert_from_bytes(pdf_bytes, dpi=None)
+        convert_time = time.time() - convert_start
+        
+        total_pages = len(images)
+        logger.info(f"Converted {total_pages} pages in {convert_time:.2f}s")
+        
+        all_results = []
+        total_tables = 0
+        pages_with_tables = 0
+        
+        # Process each page
+        for page_num, image in enumerate(images, start=1):
+            print(f"Processing page {page_num}/{total_pages}...")
+            
+            page_result = detect_tables_in_page(image, page_num, total_pages)
+            all_results.append(page_result)
+            
+            if page_result["has_tables"]:
+                pages_with_tables += 1
+                total_tables += page_result["table_count"]
+        
+         # Merge tables that span multiple pages
+        all_results = merge_continued_tables(all_results)
+        
+        # Recalculate totals after merging
+        total_tables = sum(r.get("table_count", 0) for r in all_results)
+        pages_with_tables = sum(1 for r in all_results if r.get("has_tables"))
+        
+        total_time = time.time() - start_time
+        
+        logger.info("="*80)
+        logger.info(f"PDF Processing Complete")
+        logger.info(f"  Total pages: {total_pages}")
+        logger.info(f"  Pages with tables: {pages_with_tables}")
+        logger.info(f"  Total tables extracted: {total_tables}")
+        logger.info(f"  Total processing time: {total_time:.2f}s")
+        logger.info(f"  Average time per page: {total_time/total_pages:.2f}s")
+        logger.info("="*80)
+        
+        # Create output structure
+        output_data = {
+            "document_name": filename,
+            "extraction_timestamp": datetime.now().isoformat(),
+            "total_pages": total_pages,
+            "pages_with_tables": pages_with_tables,
+            "total_tables_extracted": total_tables,
+            "processing_time_seconds": round(total_time, 2),
+            "average_time_per_page": round(total_time/total_pages, 2),
+            "extraction_results": all_results
+        }
+        
+        # Save to JSON file
+        output_filename = f"{Path(filename).stem}_tables.json"
+        output_path = OUTPUT_DIR / output_filename
+        
+        logger.info(f"Saving results to: {output_path}")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        
+        return {
+            "filename": filename,
+            "total_pages": total_pages,
+            "pages_with_tables": pages_with_tables,
+            "total_tables_extracted": total_tables,
+            "processing_time_seconds": round(total_time, 2),
+            "extraction_results": all_results,
+            "output_file": str(output_path),
+            "log_file": str(log_filename)
+        }
+        
+    except Exception as e:
+        logger.error(f"Fatal error processing PDF: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+
+@app.get("/")
+async def root():
+    """API health check"""
+    return {
+        "message": "PDF Table Extraction API",
+        "status": "active",
+        "version": "1.0.0",
+        "features": ["multi-page-tables", "detailed-logging", "performance-tracking"]
+    }
+
+
+@app.post("/extract-tables/", response_model=TableExtractionResponse)
+async def extract_tables(file: UploadFile = File(...)):
+    """
+    Extract tables from uploaded PDF file
+    
+    - Detects all tables in the PDF
+    - Extracts complete table structure including merged cells
+    - Handles tables that span multiple pages
+    - Returns JSON with all extracted tables
+    - Saves results to extracted_tables directory
+    - Creates detailed log file for debugging
+    """
+    # Validate file type
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    
+    # Check API key
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(
+            status_code=500, 
+            detail="GEMINI_API_KEY not found in environment variables"
+        )
+    
+    try:
+        # Read PDF file
+        pdf_bytes = await file.read()
+        
+        # Process PDF
+        result = process_pdf(pdf_bytes, file.filename)
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"API Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/results/{filename}")
+async def get_results(filename: str):
+    """
+    Retrieve previously extracted table results
+    """
+    output_path = OUTPUT_DIR / filename
+    
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Results file not found")
+    
+    with open(output_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    return JSONResponse(content=data)
+
+
+@app.get("/list-results/")
+async def list_results():
+    """
+    List all available extraction results
+    """
+    files = [f.name for f in OUTPUT_DIR.glob("*.json")]
+    return {"results_files": files, "count": len(files)}
+
+
+@app.get("/logs/")
+async def list_logs():
+    """
+    List all available log files
+    """
+    log_files = [
+        {
+            "filename": f.name,
+            "size_kb": round(f.stat().st_size / 1024, 2),
+            "created": datetime.fromtimestamp(f.stat().st_ctime).isoformat()
+        }
+        for f in LOG_DIR.glob("*.log")
+    ]
+    return {"log_files": log_files, "count": len(log_files)}
+
+
+@app.get("/logs/{filename}")
+async def get_log(filename: str):
+    """
+    Retrieve a specific log file
+    """
+    log_path = LOG_DIR / filename
+    
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail="Log file not found")
+    
+    with open(log_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    return {"filename": filename, "content": content}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting PDF Table Extraction API Server...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

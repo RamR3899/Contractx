@@ -492,20 +492,24 @@ class KnowledgeGraphBuilder:
             WITH v
             MATCH (p:Page {id: $page_id})
             CREATE (p)-[:HAS_VISUAL]->(v)
+            RETURN v.id as visual_id
             """
-            session.run(query, {
-                "visual_id": visual_id,
-                "visual_id_val": visual['visual_id'],
-                "type": visual['type'],
-                "bbox": visual['bbox'],
-                "width": visual['width'],
-                "height": visual['height'],
-                "area": visual['area'],
-                "page_id": page_id
-            })
-            stats['visuals'] += 1
-            stats['total_nodes'] += 1
-            stats['relationships'] += 1
+            try:
+                session.run(query, {
+                    "visual_id": visual_id,
+                    "visual_id_val": visual['visual_id'],
+                    "type": visual['type'],
+                    "bbox": visual['bbox'],
+                    "width": visual['width'],
+                    "height": visual['height'],
+                    "area": visual['area'],
+                    "page_id": page_id
+                })
+                stats['visuals'] += 1
+                stats['total_nodes'] += 1
+                stats['relationships'] += 1
+            except Exception as e:
+                print(f"  [!] Error creating visual node: {e}")
         
         return stats
     

@@ -10,7 +10,7 @@ class Config:
     
     # API Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
     
     # Rate Limiting Configuration
     GEMINI_REQUEST_DELAY = float(os.getenv("GEMINI_REQUEST_DELAY", "2.0"))  # seconds between requests

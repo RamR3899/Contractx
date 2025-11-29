@@ -5,13 +5,12 @@ import uvicorn
 import os
 from datetime import datetime
 from dotenv import load_dotenv
+from app.config.config import Config
 
 load_dotenv()
 
 from app.services.pdf_processor import PDFProcessor
 from app.services.text_analyzer import TextAnalyzer
-from app.services.advanced_table_detector import AdvancedTableDetector
-from app.services.gemini_table_extractor import GeminiTableExtractor
 from app.services.image_detector import ImageDetector
 from app.services.knowledge_graph_builder import KnowledgeGraphBuilder
 from app.utils.file_handler import FileHandler
@@ -34,8 +33,6 @@ app.add_middleware(
 file_handler = FileHandler()
 pdf_processor = PDFProcessor()
 text_analyzer = TextAnalyzer()
-table_detector = AdvancedTableDetector()
-table_extractor = GeminiTableExtractor()
 image_detector = ImageDetector()
 kg_builder = KnowledgeGraphBuilder()
 
@@ -127,9 +124,9 @@ async def extract_and_build_kg(
             "summary": create_summary(all_page_results),
             "metadata": {
                 "dpi": dpi,
-                "extraction_method": "table-transformer + gemini-2.5-flash",
+                "extraction_method": "gemini-table-extractor",
                 "text_model": "gemini-2.0-flash-exp",
-                "table_detection_model": "microsoft/table-transformer-detection",
+                "table_extraction_model": Config.GEMINI_MODEL,                
                 "version": "3.0.0",
                 "features": [
                     "Multi-scale table detection",
@@ -156,7 +153,14 @@ async def extract_and_build_kg(
             print("[Step 4] Building Knowledge Graph...")
             kg_result = kg_builder.build_graph(final_result)
             final_result['knowledge_graph'] = kg_result
-            print(f"[OK] Knowledge Graph built: {kg_result['total_nodes']} nodes, {kg_result['total_relationships']} relationships")
+            
+            # Check if KG build was successful
+            if kg_result.get('status') == 'success':
+                print(f"[OK] Knowledge Graph built: {kg_result['total_nodes']} nodes, {kg_result['total_relationships']} relationships")
+            elif 'error' in kg_result:
+                print(f"[WARNING] Knowledge Graph build failed: {kg_result['error']}")
+            else:
+                print(f"[WARNING] Knowledge Graph build failed with unknown error")
         else:
             final_result['knowledge_graph'] = {"status": "skipped"}
         
@@ -259,9 +263,9 @@ async def extract_document(
             "summary": create_summary(all_page_results),
             "metadata": {
                 "dpi": dpi,
-                "extraction_method": "table-transformer + gemini-2.5-flash",
+                "extraction_method": "gemini-table-extractor",
                 "text_model": "gemini-2.0-flash-exp",
-                "table_detection_model": "microsoft/table-transformer-detection",
+                "table_extraction_model": Config.GEMINI_MODEL,                
                 "version": "3.0.0",
                 "features": [
                     "Multi-scale table detection",
@@ -304,7 +308,7 @@ async def process_single_page(page_number: int, page_data: dict, total_pages: in
     """
     Process a single page completely:
     1. Text analysis
-    2. Table detection & extraction
+    2. Table detection & extraction (using Gemini directly)
     3. Image/visual detection
     """
     result = {
@@ -316,43 +320,45 @@ async def process_single_page(page_number: int, page_data: dict, total_pages: in
     }
     
     # Step 1: Text Analysis
-    print(f"\n  [1/4] Analyzing text content...")
+    print(f"\n  [1/3] Analyzing text content...")
     result["text_analysis"] = await text_analyzer.analyze_text(
         page_number=page_number,
         page_data=page_data
     )
     print(f"  [OK] Found {result['text_analysis']['sections_count']} sections")
     
-    # Step 2: Advanced Table Detection
-    print(f"\n  [2/4] Detecting tables (multi-scale)...")
-    detected_tables = table_detector.detect_tables(
-        page_image=page_data['pil_image'],
-        page_number=page_number
+    # Step 2: Table Detection & Extraction (Combined with Gemini)
+    print(f"\n  [2/3] Detecting and extracting tables...")
+    table_result = await pdf_processor.detect_tables_in_page(
+    page_image=page_data['pil_image'],
+    page_num=page_number,
+    total_pages=total_pages
     )
-    
-    if detected_tables:
-        print(f"  [OK] Detected {len(detected_tables)} table(s)")
-        
-        # Extract each table with Gemini
-        print(f"\n  [3/4] Extracting table structures...")
-        for idx, table_bbox in enumerate(detected_tables, start=1):
-            print(f"    [i] Extracting table {idx}/{len(detected_tables)}...")
-            
-            table_data = await table_extractor.extract_table(
-                page_image=page_data['pil_image'],
-                bbox=table_bbox['bbox'],
-                confidence=table_bbox['confidence'],
-                page_number=page_number,
-                table_index=idx
-            )
-            
-            result['tables'].append(table_data)
-            print(f"    [OK] Table {idx}: {table_data['total_rows']}x{table_data['total_columns']}")
+
+    result["tables"] = table_result.get("tables", [])
+    # Use the tables already extracted by pdf_processor
+    if result["tables"]:
+        print(f"  [OK] Found {len(result['tables'])} table(s)")
+
+        # Print table details
+        for idx, table in enumerate(result['tables'], start=1):
+            rows = table.get('total_rows', 0)
+            cols = table.get('total_columns', 0)
+            print(f"    [i] Table {idx}: {rows}x{cols}")
+
+            if table.get('has_merged_cells'):
+                print(f"        → Has merged cells: {table.get('merged_cells', 'Yes')}")
+
+            if table.get('continued_from_previous_page'):
+                print(f"        → Continued from previous page")
+
+            if table.get('continues_to_next_page'):
+                print(f"        → Continues to next page")
     else:
         print(f"  [i] No tables detected on this page")
     
-    # Step 4: Image/Visual Detection
-    print(f"\n  [4/4] Detecting images and visuals...")
+    # Step 3: Image/Visual Detection
+    print(f"\n  [3/3] Detecting images and visuals...")
     detected_visuals = image_detector.detect_images(
         page_image=page_data['pil_image'],
         page_number=page_number,
@@ -368,8 +374,14 @@ async def process_single_page(page_number: int, page_data: dict, total_pages: in
         "types": list(set([v['type'] for v in detected_visuals])) if detected_visuals else []
     }
     
+    if detected_visuals:
+        print(f"  [OK] Found {len(detected_visuals)} visual(s)")
+        for visual in detected_visuals:
+            print(f"    [i] {visual['type']}: {visual.get('description', 'N/A')}")
+    else:
+        print(f"  [i] No visuals detected on this page")
+    
     return result
-
 
 def create_summary(page_results):
     """Create summary from all pages"""
@@ -436,32 +448,31 @@ async def health_check():
         "status": "healthy",
         "models": {
             "text_analysis": "gemini-2.0-flash-exp",
-            "table_detection": table_detector.get_status(),
-            "table_extraction": table_extractor.get_status()
+            "table_extraction_model": Config.GEMINI_MODEL
         },
         "version": "3.0.0"
     }
 
 
-@app.get("/")
-async def root():
-    return {
-        "service": "ContractX Complete Document Analysis",
-        "version": "3.0.0",
-        "endpoints": {
-            "extract": "/api/v1/extract-document",
-            "health": "/health",
-            "docs": "/docs"
-        },
-        "features": [
-            "Page-by-page processing",
-            "Multi-scale table detection",
-            "Gemini table extraction",
-            "Merged cell handling",
-            "Text analysis (sections, entities)",
-            "Automatic retry logic"
-        ]
-    }
+# @app.get("/")
+# async def root():
+#     return {
+#         "service": "ContractX Complete Document Analysis",
+#         "version": "3.0.0",
+#         "endpoints": {
+#             "extract": "/api/v1/extract-document",
+#             "health": "/health",
+#             "docs": "/docs"
+#         },
+#         "features": [
+#             "Page-by-page processing",
+#             "Multi-scale table detection",
+#             "Gemini table extraction",
+#             "Merged cell handling",
+#             "Text analysis (sections, entities)",
+#             "Automatic retry logic"
+#         ]
+#     }
 
 
 @app.get("/")
